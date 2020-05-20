@@ -23,12 +23,13 @@
 /**
  * @file Networking.hpp
  * @author Grama Nicolae (gramanicu@gmail.com)
- * @brief This is a simple library that manages tcp/udp connections. It defines both a server and a client
+ * @brief This is a simple library that manages tcp/udp connections. It defines
+ * both a server and a client
  * @version 1.0
  * @date 19-05-2020
- * 
+ *
  * @copyright Copyright (c) 2020
- * 
+ *
  */
 
 #pragma once
@@ -41,9 +42,9 @@
 
 #include <cstring>
 #include <iostream>
+#include <set>
 #include <sstream>
 #include <string>
-#include <vector>
 
 #define lint uint64_t  // Long Int
 #define uint uint32_t  // Unsigned Int
@@ -123,10 +124,12 @@ class Server {
     bool (*read_input)(Server *);
     bool (*read_tcp)(char *, uint, Server *);
     bool (*read_udp)(char *, sockaddr_in, Server *);
+    bool (*new_connection)(uint, sockaddr_in, Server *);
+    bool (*disconnect)(uint, Server *);
     fd_set read_fds, tmp_fds;
     sockaddr_in listen_addr;
 
-    std::vector<uint> client_sockets;
+    std::set<uint> client_sockets;
 
     /**
      * @brief Prepare, bind and start listening
@@ -152,7 +155,7 @@ class Server {
     /**
      * @brief This function manages new TCP connections
      */
-    void accept_connection() {
+    bool accept_connection() {
         // Accept the new connection
         sockaddr_in client_addr;
         socklen_t client_len = sizeof(client_addr);
@@ -164,11 +167,9 @@ class Server {
         FD_SET(new_sockfd, &read_fds);
         max_fd = std::max(max_fd, (uint)new_sockfd);
 
-        std::stringstream ss;
-        ss << "New connection from " << inet_ntoa(client_addr.sin_addr) << ":"
-           << ntohs(client_addr.sin_port) << "\n";
+        client_sockets.insert(new_sockfd);
 
-        console_log(ss.str());
+        return new_connection(new_sockfd, client_addr, this);
     }
 
     /**
@@ -186,10 +187,9 @@ class Server {
             // Client disconnected
             close_skt(sockfd);
             FD_CLR(sockfd, &read_fds);
-            std::stringstream ss;
-            ss << "Client " << sockfd << " disconnected\n";
-            console_log(ss.str());
-            return false;
+            client_sockets.erase(sockfd);
+
+            return disconnect(sockfd, this);
         } else {
             return read_tcp(msg, sockfd, this);
         }
@@ -214,11 +214,11 @@ class Server {
    public:
     /**
      * @brief Send a udp message to the specified address
-     * @param text The text in the message
      * @param client_addr The address
+     * @param text The text in the message
      */
-    void send_udp_message(std::string text, sockaddr_in client_addr) {
-        char msg[1500];
+    void send_udp_message(sockaddr_in client_addr, std::string text) {
+        char msg[BUFFER_SIZE];
         safe_cpy(msg, text.c_str(), text.size());
         CERR(sendto(udp_sock, msg, strlen(msg) + 1, 0, (sockaddr *)&client_addr,
                     sizeof(client_addr)) < 0);
@@ -226,33 +226,61 @@ class Server {
 
     /**
      * @brief Send a udp message to the specified address
-     * @param msg The buffer
      * @param client_addr The adress
+     * @param msg The buffer
      */
-    void send_udp_message(char *msg, sockaddr_in client_addr) {
+    void send_udp_message(sockaddr_in client_addr, char *msg) {
         CERR(sendto(udp_sock, msg, strlen(msg) + 1, 0, (sockaddr *)&client_addr,
                     sizeof(client_addr)) < 0);
     }
 
     /**
      * @brief Send tcp message on the specified socket
-     * @param text The text in the message
      * @param tcp_sock The socket number
+     * @param text The text in the message
      */
-    void send_tcp_message(std::string text, uint tcp_sock) {
-        char msg[1500];
+    void send_tcp_message(uint tcp_sock, std::string text) {
+        char msg[BUFFER_SIZE];
         safe_cpy(msg, text.c_str(), text.size());
         CERR(send(tcp_sock, msg, strlen(msg) + 1, 0) < 0);
     }
 
     /**
      * @brief Send tcp message on the specified socket
-     * @param text The buffer
      * @param tcp_sock The socket number
+     * @param msg The buffer
      */
-    void send_tcp_message(char *msg, uint tcp_sock) {
+    void send_tcp_message(uint tcp_sock, char *msg) {
         CERR(send(tcp_sock, msg, strlen(msg) + 1, 0) < 0);
     }
+
+    /**
+     * @brief Send a tcp message to all the clients
+     * @param msg The buffer
+     */
+    void broadcast_tcp_message(char *msg) {
+        for (auto &sockfd : client_sockets) {
+            CERR(send(sockfd, msg, strlen(msg) + 1, 0) < 0);
+        }
+    }
+
+    /**
+     * @brief Send a tcp message to all the clients
+     * @param text The text in the message
+     */
+    void broadcast_tcp_message(std::string text) {
+        char msg[BUFFER_SIZE];
+        safe_cpy(msg, text.c_str(), text.size());
+        for (auto &sockfd : client_sockets) {
+            CERR(send(sockfd, msg, strlen(msg) + 1, 0) < 0);
+        }
+    }
+
+    /**
+     * @brief Return a set with all client's sockets
+     * @return std::set<uint>& The set of sockets
+     */
+    std::set<uint> &get_clients_sockfd() { return client_sockets; }
 
     /**
      * @brief Construct a new server
@@ -260,17 +288,24 @@ class Server {
      * @param fin A function that manages stdin "events"
      * @param ftcp A function that manages new tcp messages
      * @param fudp A function that manages new udp messages
-     * All the 3 function return a bool, that tells the server whether or not to
-     * close
+     * @param new_conn A function that manages new connection (aditional
+     * functionality)
+     * @param disconn A function that manages disconnects (aditional
+     * functionality) All the 5 function return a bool, that tells the server
+     * whether or not to close
      */
     explicit Server(const uint main_port, bool (*fin)(Server *),
                     bool (*ftcp)(char *, uint, Server *),
-                    bool (*fudp)(char *, sockaddr_in, Server *))
+                    bool (*fudp)(char *, sockaddr_in, Server *),
+                    bool (*new_conn)(uint, sockaddr_in, Server *),
+                    bool (*disconn)(uint, Server *))
         : main_port(main_port),
           max_fd(0),
           read_input(fin),
           read_tcp(ftcp),
-          read_udp(fudp) {
+          read_udp(fudp),
+          new_connection(new_conn),
+          disconnect(disconn) {
         // Initialise the main TCP socket
         int sock = socket(AF_INET, SOCK_STREAM, 0);
         CERR(sock < 0);
@@ -304,8 +339,6 @@ class Server {
         listen_addr.sin_family = AF_INET;
         listen_addr.sin_port = htons(main_port);
         listen_addr.sin_addr.s_addr = INADDR_ANY;
-
-        client_sockets = std::vector<uint>(0);
     }
 
     /**
@@ -335,7 +368,9 @@ class Server {
                             return;
                         }
                     } else if (i == main_tcp_sock) {
-                        accept_connection();
+                        if (accept_connection()) {
+                            return;
+                        }
                     } else if (i == udp_sock) {
                         if (read_udp_message()) {
                             return;
@@ -394,7 +429,6 @@ class Client {
 
         if (msg_size == 0) {
             // Serverc closed = Close client
-            close_skt(tcp_sock);
             FD_CLR(tcp_sock, &read_fds);
             return true;
         } else {
@@ -423,7 +457,7 @@ class Client {
      * @brief Send an udp message
      * @param msg The buffer
      */
-    void send_udp_message(char* msg) {
+    void send_udp_message(char *msg) {
         CERR(sendto(udp_sock, msg, strlen(msg) + 1, 0, (sockaddr *)&server_addr,
                     sizeof(server_addr)) < 0);
     }
@@ -438,20 +472,18 @@ class Client {
         CERR(sendto(udp_sock, msg, strlen(msg) + 1, 0, (sockaddr *)&server_addr,
                     sizeof(server_addr)) < 0);
     }
-    
+
     /**
-     * @brief Send tcp message on the specified socket
+     * @brief Send tcp message to the server
      * @param msg The buffer
-     * @param tcp_sock The socket number
      */
-    void send_tcp_message(char* msg, uint tcp_sock) {
+    void send_tcp_message(char *msg) {
         CERR(send(tcp_sock, msg, strlen(msg) + 1, 0) < 0);
     }
 
     /**
-     * @brief Send tcp message on the specified socket
+     * @brief Send tcp message to the server
      * @param text The text in the message
-     * @param tcp_sock The socket number
      */
     void send_tcp_message(std::string text) {
         char msg[1500];
